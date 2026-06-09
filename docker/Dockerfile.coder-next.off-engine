@@ -1,0 +1,311 @@
+# Placeholders to fill in for your environment:
+#   <YOUR_SGLANG_BASE_IMAGE>   — base SGLang image (e.g. lmsys/sglang:0.5.8.post1)
+#                                The image must ship sglang 0.5.8 or 0.5.10. We
+#                                upgrade to 0.5.10.post1 + overlay our HS-bug
+#                                patches in subsequent layers.
+#   <YOUR_REGISTRY>            — your container registry prefix
+#   <PRESET_MODELS_DIR>        — path inside the container where the backbone
+#                                weights are mounted (was /preset-models)
+#   <HF_CACHE_DIR>             — path to the HuggingFace cache (was a
+#                                JuiceFS mount in the original setup)
+#
+FROM <YOUR_SGLANG_BASE_IMAGE>
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Dependencies ──────────────────────────────────────────────────────────
+
+RUN apt-get update -qq && apt-get install -y -qq nginx >/dev/null 2>&1 && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115.0" \
+    "uvicorn>=0.34.0" \
+    "typer>=0.15.0" \
+    "pydantic>=2.0.0" \
+    "rich" \
+    "tqdm"
+
+# ── SGLang upgrade: 0.5.8.post1 → 0.5.10.post1 + HS bug patches ────────
+# Base image ships an editable install of 0.5.8.post1 with two production bugs:
+#   Bug #1: mixed HS/non-HS requests → output_hidden_states[i] IndexError in
+#           tokenizer_manager → TokenizerManager dies → whole server hangs.
+#   Bug #2: chunked-prefill only captures the LAST chunk's HS and slices by
+#           len(origin_input_ids); earlier chunks are silently dropped and the
+#           last chunk's tokens are mislabeled as positions [0, last_chunk_len).
+#           This is why SGLang-extracted features had measurably worse probe
+#           signal than transformers-extracted ones (long prompts get truncated
+#           + semantically misaligned HS).
+# 0.5.10.post1 has the same two bugs. We upgrade and then overlay patched
+# scheduler_output_processor_mixin.py + tokenizer_manager.py with:
+#   - chunked-prefill HS accumulation via extend_input_len_per_req[i] (Bug #2)
+#   - None-padded output_hidden_states for mixed batches (Bug #1, root fix)
+#   - defensive i < len(...) guard in tokenizer_manager (Bug #1, belt-and-braces)
+#   - PR #16776: .tolist() → .float().numpy() for ~10x HS serialization speedup
+#   - Binary HS wire format: meta_info.hidden_states is now a dict
+#     {__binary__, shape, dtype, data=base64(tobytes())} instead of a nested
+#     list of floats. A 16k × 2048 float32 HS used to JSON-encode to 1-3GB of
+#     text; base64 of raw bytes is ~170MB (+33% over binary, 10-20x smaller
+#     than JSON). pruner_server falls back to the legacy list format if an
+#     older overlay is running, so rolling deploys are safe.
+#   - fp16 HS downcast: scheduler emits .half().numpy() instead of .float()
+#     .numpy(), halving wire size again (32 MB binary / 43 MB base64 for a
+#     16k × 2048 prompt). bf16→fp16 is lossless for |HS|<65504; client
+#     detects non-finite values and logs a warning if overflow occurs.
+#
+# 0.5.10 also renamed the kernel package: sgl-kernel (old) → sglang-kernel.
+RUN pip uninstall -y sglang sgl-kernel && \
+    pip install --no-cache-dir 'sglang==0.5.10.post1' 'sglang-kernel==0.4.1.post1'
+
+# flashinfer upgrade: sglang 0.5.10 asserts flashinfer_python >= 0.6.7.post3 at
+# engine startup; the mwh:latest base ships 0.6.1 and hard-fails the assertion.
+# flashinfer also enforces cubin/jit-cache versions == python version at runtime,
+# so we pin all three to 0.6.7.post3.
+# Offline install: pre-downloaded wheels in wheels/flashinfer/ (8 files):
+#   - flashinfer-python  (9MB, py3-none-any)
+#   - flashinfer-cubin   (281MB, precompiled kernel binaries for all GPU archs)
+#   - flashinfer-jit-cache (1.8GB, cu129 prebuilt kernel cache — only published
+#     on flashinfer.ai/whl/cu129, not the internal mirror)
+#   - 5 deps not in base: apache-tvm-ffi, cuda-tile, einops,
+#     nvidia-cudnn-frontend, nvidia-cutlass-dsl
+# Other deps (torch, numpy, click, ninja, packaging, requests, tabulate, tqdm,
+# nvidia-ml-py) come from the base image.
+RUN pip install --no-cache-dir flashinfer-python==0.6.7.post3
+
+# Overlay patched python files on top of installed sglang. Pure-python modules,
+# no compile step. Version stays reported as 0.5.10.post1.
+COPY patches/sglang/srt/managers/scheduler_output_processor_mixin.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py
+COPY patches/sglang/srt/managers/tokenizer_manager.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/tokenizer_manager.py
+COPY patches/sglang/srt/managers/scheduler.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py
+# Bug #3 (HS prefix-cache cap): cached-prefix tokens carry KV but no HS, so
+# when an earlier identical-prefix request populated radix cache past
+# tr_start, the second request silently lost HS for that region. We add a
+# new hidden_states_start_len field that mirrors logprob_start_len's cap on
+# max_prefix_len in init_next_round_input, forcing tokens after the cap to
+# go through prefill. Touches schedule_batch.py (field + cap) and io_struct.py
+# (request payload field + per-element projection); the existing
+# tokenizer_manager.py / scheduler.py overlays were extended in-place to
+# forward the new field through to Req.
+COPY patches/sglang/srt/managers/schedule_batch.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/schedule_batch.py
+COPY patches/sglang/srt/managers/io_struct.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/io_struct.py
+# Syntax-only check: build host has no GPU, so a full import would pull in
+# sgl_kernel CUDA symbols and fail. py_compile catches syntax errors without
+# touching the import chain; runtime import happens when SGLang starts.
+# Also grep for the load-bearing hunks — if any of these lines is missing
+# from the overlay, the corresponding bug fix is silently absent and
+# regresses to upstream behavior:
+#   * scheduler.py snapshot guard pairs with mixin's per-chunk HS access
+#     (Bug #2/#3); without it, HS-without-logprob requests crash with
+#     "'NoneType' object is not subscriptable".
+#   * mixin's extend_input_len_per_req[i] guard is the chunked-prefill
+#     accumulation patch itself (Bug #2).
+#   * schedule_batch.py hidden_states_start_len cap is the prefix-cache
+#     fix (Bug #3); without it, identical-prefix requests silently lose
+#     HS for the cached region.
+RUN python3 -m py_compile \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/tokenizer_manager.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/schedule_batch.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/io_struct.py \
+    && grep -q "batch.return_logprob or batch.return_hidden_states" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py \
+    && grep -q "extend_input_len_per_req is not None" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py \
+    && grep -q "self.return_hidden_states and self.hidden_states_start_len >= 0" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/schedule_batch.py \
+    && echo "sglang HS patches compiled + verified OK"
+
+# train_llm package (provides PruningHead, metrics.build_token_line_ids, etc.)
+# Install the swe_pruner_pro package (provides PruningHead, build_token_line_ids, etc.).
+COPY pyproject.toml /home/work/swe_pruner_pro/pyproject.toml
+COPY src/ /home/work/swe_pruner_pro/src/
+RUN pip install --no-cache-dir /home/work/swe_pruner_pro/
+
+# Pruner server code
+COPY src/swe_pruner_pro/serving/pruner_server.py /home/work/bin/
+
+# ── CloudML custom framework compliance ───────────────────────────────────
+#
+# Internal services:
+#   SGLang    → localhost:30000
+#   Pruner    → localhost:8001
+#
+# Nginx (port 80) does path-based routing with prefix stripping:
+#   /model-raw/*     → localhost:30000/*
+#   /prune-server/*  → localhost:8001/*
+#   /*               → localhost:8001/*   (default to pruner)
+#
+# Health probe on port 9000 (k8s liveness/readiness).
+
+RUN mkdir -p /home/work/bin /home/work/log
+
+# Nginx config: path-based routing with prefix strip
+RUN printf '%s\n' \
+    'worker_processes 2;' \
+    'events { worker_connections 1024; }' \
+    'http {' \
+    '    server {' \
+    '        listen 80;' \
+    '        location /model-raw/ {' \
+    '            proxy_pass http://127.0.0.1:30000/;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 300s;' \
+    '            proxy_send_timeout 300s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '        location /prune-server/ {' \
+    '            proxy_pass http://127.0.0.1:8001/;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 120s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '        location / {' \
+    '            proxy_pass http://127.0.0.1:8001;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 120s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '    }' \
+    '}' \
+    > /etc/nginx/nginx.conf
+
+# Health probe server for k8s on port 9000
+RUN printf '%s\n' \
+    'from http.server import BaseHTTPRequestHandler, HTTPServer' \
+    '' \
+    'class Handler(BaseHTTPRequestHandler):' \
+    '    def do_GET(self):' \
+    '        self.send_response(200)' \
+    '        self.send_header("Content-type", "text/plain")' \
+    '        self.end_headers()' \
+    '        self.wfile.write(b"Alive")' \
+    '    def log_message(self, format, *args):' \
+    '        pass' \
+    '' \
+    'if __name__ == "__main__":' \
+    '    HTTPServer(("", 9000), Handler).serve_forever()' \
+    > /home/work/bin/health.py
+
+# Entrypoint: starts nginx + health probe + SGLang + pruner
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '' \
+    '# Nginx reverse proxy (port 80)' \
+    'nginx' \
+    'echo "[start] Nginx started on port 80"' \
+    '' \
+    '# Health probe for k8s (port 9000)' \
+    'nohup python3 /home/work/bin/health.py \' \
+    '    1>/home/work/log/health.log 2>&1 &' \
+    '' \
+    'SGLANG_PORT=${SGLANG_PORT:-30000}' \
+    'PRUNER_PORT=${PRUNER_PORT:-8001}' \
+    '' \
+    '# Single SGLang server (TP=8, hidden states + tool-call-parser)' \
+    '# Supervisor loop: restart SGLang if it dies (defense against remaining' \
+    '# crash paths — upstream tokenizer_manager has other known failure modes).' \
+    '#' \
+    '# Qwen3-Next-80B-A3B tuning notes (addresses low SM / HBM utilization):' \
+    '#   - NEXTN (MTP) speculative decode DISABLED (Bug #4, 2026-04-30):' \
+    '#     EAGLE v2 + hybrid_linear_attn + flashinfer + overlap schedule has a' \
+    '#     CUDA kernel hang on the draft-extend-for-decode path. In production' \
+    '#     we hit it after a long-running session on 2026-04-30 05:37:13:' \
+    '#       "Scheduler watchdog timeout (self.watchdog_timeout=300, soft=False)"' \
+    '#     followed immediately by SIGQUIT. Stack (MainThread stuck 300s):' \
+    '#       event_loop_overlap (scheduler.py:1361)' \
+    '#         forward_batch_generation (eagle_worker_v2.py:736)' \
+    '#           _draft_extend_for_decode (eagle_worker_v2.py:565)' \
+    '#             prepare_for_extend_to_fill_draft_kvcache (eagle_info_v2:208)' \
+    '#               init_forward_metadata (hybrid_linear_attn_backend:737)' \
+    '#                 init_forward_metadata (flashinfer_backend:499)' \
+    '#                   update_single_wrapper (flashinfer_backend:1252)' \
+    '#                     .item() → cudaStreamSynchronize (never returns)' \
+    '#     Hang reproduces with the NEXTN+hybrid_linear+flashinfer+overlap' \
+    '#     combo; --disable-overlap-schedule and lower --speculative-num-steps' \
+    '#     reduce frequency but do not eliminate. Fully disabling spec decode' \
+    '#     is the only stable option until upstream fixes the draft-extend' \
+    '#     kernel sync. Throughput cost is negligible here: pruner decode is' \
+    '#     max_new_tokens=1 (we only consume prefill HS), so NEXTN was never' \
+    '#     exercised on the hot path anyway.' \
+    '#   - DeepEP a2a backend: with EP=8 over 512 experts the default all-to-all' \
+    '#     is the dominant overhead. DeepEP fuses intranode dispatch.' \
+    '#     --deepep-mode normal (NOT auto): auto would pick low_latency at small' \
+    '#     decode batch sizes, which dispatches to forward_deepgemm_masked — that' \
+    '#     path is deprecated in sglang 0.5.10 (assert False, crashes CUDA graph' \
+    '#     capture). normal stays on the standard all-to-all.' \
+    '#   - Dropped --dp-size / --enable-dp-attention: replicating attention 8x' \
+    '#     fragments the KV pool, caps running batch, and starves the MoE.' \
+    '#     For A3B the attention is tiny; TP-only is a better default.' \
+    '#   - cuda-graph-max-bs 128 + max-running-requests 256: lets decode batch' \
+    '#     grow enough to amortize expert weight loads.' \
+    '#   - --page-size 64: required by Qwen3-Next mamba regardless of spec decode' \
+    '#     (page-size must divide FLA_CHUNK_SIZE=64). --mamba-scheduler-strategy' \
+    '#     falls back to default no_buffer once spec decode is off — no_buffer' \
+    '#     only errored out under NEXTN, which we have now removed.' \
+    'echo "[start] Starting SGLang: model=$PRUNER_BACKBONE, TP=${TP_SIZE:-8}, port=$SGLANG_PORT"' \
+    '( while true; do' \
+    '    echo "[supervisor] starting SGLang at $(date)" >> /home/work/log/sglang.log' \
+    '    python3 -m sglang.launch_server \' \
+    '        --model-path "$PRUNER_BACKBONE" \' \
+    '        --tp "${TP_SIZE:-8}" \' \
+    '        --ep-size "${TP_SIZE:-8}" \' \
+    '        --trust-remote-code \' \
+    '        --chunked-prefill-size 16384 \' \
+    '        --cuda-graph-max-bs 128 \' \
+    '        --max-running-requests 256 \' \
+    '        --dtype bfloat16 \' \
+    '        --mem-fraction-static 0.88 \' \
+    '        --enable-return-hidden-states \' \
+    '        --tool-call-parser qwen3_coder \' \
+    '        --port "$SGLANG_PORT" \' \
+    '        1>>/home/work/log/sglang.log 2>&1' \
+    '    echo "[supervisor] SGLang exited (rc=$?) at $(date), restart in 10s" >> /home/work/log/sglang.log' \
+    '    sleep 10' \
+    '  done ) &' \
+    '' \
+    '# Start pruner server' \
+    'echo "[start] Starting pruner: checkpoint=$PRUNER_CHECKPOINT, port=$PRUNER_PORT"' \
+    'exec python3 /home/work/bin/pruner_server.py \' \
+    '    --sglang-url "http://localhost:$SGLANG_PORT" \' \
+    '    --port "$PRUNER_PORT" \' \
+    '    --host "0.0.0.0" \' \
+    '    --device "${PRUNER_DEVICE:-cuda:0}" \' \
+    '    --max-length "${PRUNER_MAX_LENGTH:-16384}" \' \
+    '    2>&1 | tee /home/work/log/pruner.log' \
+    > /home/work/bin/start.sh
+
+RUN chmod +x /home/work/bin/start.sh
+
+WORKDIR /home/work/bin
+
+# Runtime mounts (via cloudml -u or volume):
+#   PRUNER_BACKBONE    — backbone model path (for SGLang + tokenizer)
+#   PRUNER_CHECKPOINT  — pruning head checkpoint dir
+# Optional:
+#   TP_SIZE            — tensor parallel size (default: 8)
+#   SGLANG_PORT        — SGLang port (default: 30000, internal only)
+#   PRUNER_PORT        — pruner server port (default: 8001, internal only)
+#   PRUNER_DEVICE      — pruning head GPU (default: cuda:0)
+#   PRUNER_MAX_LENGTH  — max input length (default: 16384)
+#
+# Architecture: single SGLang (TP=8) + radix cache enabled
+#   --enable-return-hidden-states for pruner
+#   Radix cache enabled. Patches Bug #1/#2/#3 keep HS robust under cache hits:
+#     #1 mixed-batch IndexError, #2 chunked-prefill HS accumulation, #3
+#     prefix-cache cap (pruner_server passes hidden_states_start_len=tr_start
+#     so identical-prefix requests still get HS for the tool_response region).
+#   --tool-call-parser qwen3_coder for agent chat/completions
+#
+# External access (via nginx on port 80):
+#   /model-raw/*     → SGLang (strip prefix)
+#   /prune-server/*  → Pruner (strip prefix)
+#   /*               → Pruner (default)
+
+EXPOSE 80 9000
+CMD ["bash", "/home/work/bin/start.sh"]

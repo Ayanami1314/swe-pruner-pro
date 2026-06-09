@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swe-pruner-pro"
+version = "0.1.0"
+description = "SWE-Pruner Pro: a coder LLM can be its own pruner"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Anonymous" }]
+dependencies = [
+  "torch>=2.1",
+  "transformers>=4.45",
+  "numpy>=1.26",
+  "rich>=13.0",
+  "typer>=0.12",
+  "pydantic>=2.0",
+  "tqdm>=4.66",
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "requests>=2.32",
+  "pybase64>=1.4",
+  "anthropic>=0.40",
+  "tensorboard>=2.16",
+]
+
+[project.optional-dependencies]
+train = ["torchmetrics>=1.4", "peft>=0.12"]
+eval = ["openai>=1.50", "datasets>=2.20", "huggingface-hub>=0.24", "docker>=7.1"]
+baselines = [
+  "llmlingua>=0.2",
+  "selective-context",
+  "FlagEmbedding>=1.3",
+  "sentence-transformers>=3.0",
+]
+
+[project.scripts]
+swe-pruner-server = "swe_pruner_pro.serving.pruner_server:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"swe_pruner_pro" = ["**/*.yaml", "**/*.json", "**/*.txt"]

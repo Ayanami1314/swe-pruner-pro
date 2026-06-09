@@ -1,0 +1,234 @@
+# Placeholders to fill in for your environment:
+#   <YOUR_SGLANG_BASE_IMAGE>   — base SGLang image (e.g. lmsys/sglang:0.5.8.post1)
+#                                The image must ship sglang 0.5.8 or 0.5.10. We
+#                                upgrade to 0.5.10.post1 + overlay our HS-bug
+#                                patches in subsequent layers.
+#   <YOUR_REGISTRY>            — your container registry prefix
+#   <PRESET_MODELS_DIR>        — path inside the container where the backbone
+#                                weights are mounted (was /preset-models)
+#   <HF_CACHE_DIR>             — path to the HuggingFace cache (was a
+#                                JuiceFS mount in the original setup)
+#
+FROM <YOUR_SGLANG_BASE_IMAGE>
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Dependencies ──────────────────────────────────────────────────────────
+
+RUN apt-get update -qq && apt-get install -y -qq nginx >/dev/null 2>&1 && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115.0" \
+    "uvicorn>=0.34.0" \
+    "typer>=0.15.0" \
+    "pydantic>=2.0.0" \
+    "rich" \
+    "tqdm"
+
+# ── SGLang upgrade: 0.5.8.post1 → 0.5.10.post1 + HS bug patches ────────
+# Base image ships an editable install of 0.5.8.post1 with two production bugs:
+#   Bug #1: mixed HS/non-HS requests → output_hidden_states[i] IndexError in
+#           tokenizer_manager → TokenizerManager dies → whole server hangs.
+#   Bug #2: chunked-prefill only captures the LAST chunk's HS and slices by
+#           len(origin_input_ids); earlier chunks are silently dropped and the
+#           last chunk's tokens are mislabeled as positions [0, last_chunk_len).
+# 0.5.10.post1 has the same two bugs. We upgrade and then overlay patched
+# scheduler_output_processor_mixin.py + tokenizer_manager.py + scheduler.py
+# with (full rationale in Dockerfile.pruner):
+#   - Bug #1 fix (mixed-batch IndexError) in tokenizer_manager + scheduler
+#   - Bug #2 fix (chunked-prefill HS accumulation) in scheduler_output_processor_mixin
+#   - Binary HS wire format: meta_info.hidden_states is a dict
+#     {__binary__, shape, dtype, data=base64(tobytes())} rather than a nested
+#     JSON list, cutting wire size 10-20×. pruner_server falls back to the
+#     legacy list format if an older overlay is running — rolling deploys safe.
+#   - fp16 HS downcast: scheduler emits .half().numpy() for another 2× savings
+#     (lossless for |HS|<65504; client logs a warning on non-finite values).
+#
+# 0.5.10 also renamed the kernel package: sgl-kernel (old) → sglang-kernel.
+RUN pip uninstall -y sglang sgl-kernel && \
+    pip install --no-cache-dir 'sglang==0.5.10.post1' 'sglang-kernel==0.4.1.post1'
+
+# Overlay patched python files on top of installed sglang (pure-python, no
+# compile step). Version stays reported as 0.5.10.post1.
+COPY patches/sglang/srt/managers/scheduler_output_processor_mixin.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py
+COPY patches/sglang/srt/managers/tokenizer_manager.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/tokenizer_manager.py
+COPY patches/sglang/srt/managers/scheduler.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py
+COPY patches/sglang/srt/managers/io_struct.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/io_struct.py
+COPY patches/sglang/srt/managers/schedule_batch.py \
+     /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/schedule_batch.py
+RUN python3 -m py_compile \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/tokenizer_manager.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/io_struct.py \
+      /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/schedule_batch.py \
+    && grep -q "batch.return_logprob or batch.return_hidden_states" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler.py \
+    && grep -q "extend_input_len_per_req is not None" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/scheduler_output_processor_mixin.py \
+    && grep -q "hidden_states_start_len: Union\[List\[int\], int\] = -1" \
+         /usr/local/lib/python3.12/dist-packages/sglang/srt/managers/io_struct.py \
+    && echo "sglang HS patches compiled + verified OK"
+
+# train_llm package (provides PruningHead, metrics.build_token_line_ids, etc.)
+# Install the swe_pruner_pro package (provides PruningHead, build_token_line_ids, etc.).
+COPY pyproject.toml /home/work/swe_pruner_pro/pyproject.toml
+COPY src/ /home/work/swe_pruner_pro/src/
+RUN pip install --no-cache-dir /home/work/swe_pruner_pro/
+
+# Pruner server code
+COPY src/swe_pruner_pro/serving/pruner_server.py /home/work/bin/
+
+# ── CloudML custom framework compliance ───────────────────────────────────
+#
+# Internal services (single node, 8 GPU):
+#   SGLang    → localhost:9001
+#   Pruner    → localhost:8001
+#
+# Nginx (port 80) does path-based routing with prefix stripping:
+#   /model-raw/*     → localhost:9001/*
+#   /prune-server/*  → localhost:8001/*
+#   /*               → localhost:8001/*   (default to pruner)
+#
+# Health probe on port 9000 (k8s liveness/readiness).
+
+RUN mkdir -p /home/work/bin /home/work/log
+
+# Nginx config: path-based routing with prefix strip
+RUN printf '%s\n' \
+    'worker_processes 2;' \
+    'events { worker_connections 1024; }' \
+    'http {' \
+    '    server {' \
+    '        listen 80;' \
+    '        location /model-raw/ {' \
+    '            proxy_pass http://127.0.0.1:9001/;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 300s;' \
+    '            proxy_send_timeout 300s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '        location /prune-server/ {' \
+    '            proxy_pass http://127.0.0.1:8001/;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 120s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '        location / {' \
+    '            proxy_pass http://127.0.0.1:8001;' \
+    '            proxy_set_header Host $host;' \
+    '            proxy_read_timeout 120s;' \
+    '            client_max_body_size 100m;' \
+    '        }' \
+    '    }' \
+    '}' \
+    > /etc/nginx/nginx.conf
+
+# Health probe server for k8s on port 9000 (every node)
+RUN printf '%s\n' \
+    'from http.server import BaseHTTPRequestHandler, HTTPServer' \
+    '' \
+    'class Handler(BaseHTTPRequestHandler):' \
+    '    def do_GET(self):' \
+    '        self.send_response(200)' \
+    '        self.send_header("Content-type", "text/plain")' \
+    '        self.end_headers()' \
+    '        self.wfile.write(b"Alive")' \
+    '    def log_message(self, format, *args):' \
+    '        pass' \
+    '' \
+    'if __name__ == "__main__":' \
+    '    HTTPServer(("", 9000), Handler).serve_forever()' \
+    > /home/work/bin/health.py
+
+# Entrypoint: single-node launcher (nginx + health + SGLang + pruner).
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '' \
+    'SGLANG_PORT="${SGLANG_PORT:-9001}"' \
+    'PRUNER_PORT="${PRUNER_PORT:-8001}"' \
+    'PRUNER_HIDDEN_SIZE="${PRUNER_HIDDEN_SIZE:-4096}"  # MiMo-V2-Flash hidden_size' \
+    '' \
+    'echo "[start] single-node deployment (tp=8 dp=2 dp-attention)"' \
+    '' \
+    '# Health probe (k8s liveness)' \
+    'nohup python3 /home/work/bin/health.py \' \
+    '    1>/home/work/log/health.log 2>&1 &' \
+    '' \
+    '# MiMo-V2-Flash launch (single node, 8 GPU; tp=8 dp=2 + dp-attention so' \
+    '# per-DP attention TP=4 — MiMo has 12 KV heads which does not divide by 8).' \
+    '# --enable-return-hidden-states is required for the pruner workload.' \
+    'launch_sglang() {' \
+    '  python3 -m sglang.launch_server \' \
+    '        --model-path "$PRUNER_BACKBONE" \' \
+    '        --served-model-name mimo-v2-flash \' \
+    '        --tp-size 8 \' \
+    '        --dp-size 2 \' \
+    '        --enable-dp-attention \' \
+    '        --moe-a2a-backend deepep \' \
+    '        --page-size 1 \' \
+    '        --host 0.0.0.0 \' \
+    '        --port "$SGLANG_PORT" \' \
+    '        --trust-remote-code \' \
+    '        --mem-fraction-static 0.75 \' \
+    '        --max-running-requests 128 \' \
+    '        --chunked-prefill-size 16384 \' \
+    '        --reasoning-parser qwen3 \' \
+    '        --tool-call-parser mimo \' \
+    '        --context-length 262144 \' \
+    '        --attention-backend fa3 \' \
+    '        --enable-return-hidden-states' \
+    '}' \
+    '' \
+    'nginx' \
+    'echo "[start] Nginx started on port 80"' \
+    '' \
+    'echo "[start] Starting SGLang: model=$PRUNER_BACKBONE, tp=8 dp=2, port=$SGLANG_PORT"' \
+    '( while true; do' \
+    '    echo "[supervisor] starting SGLang at $(date)" >> /home/work/log/sglang.log' \
+    '    launch_sglang 1>>/home/work/log/sglang.log 2>&1' \
+    '    echo "[supervisor] SGLang exited (rc=$?) at $(date), restart in 10s" >> /home/work/log/sglang.log' \
+    '    sleep 10' \
+    '  done ) &' \
+    '' \
+    'echo "[start] Starting pruner: checkpoint=$PRUNER_CHECKPOINT, port=$PRUNER_PORT"' \
+    'exec python3 /home/work/bin/pruner_server.py \' \
+    '    --sglang-url "http://localhost:$SGLANG_PORT" \' \
+    '    --port "$PRUNER_PORT" \' \
+    '    --host "0.0.0.0" \' \
+    '    --device "${PRUNER_DEVICE:-cuda:0}" \' \
+    '    --hidden-size "$PRUNER_HIDDEN_SIZE" \' \
+    '    --max-length "${PRUNER_MAX_LENGTH:-16384}" \' \
+    '    2>&1 | tee /home/work/log/pruner.log' \
+    > /home/work/bin/start.sh
+
+RUN chmod +x /home/work/bin/start.sh
+
+WORKDIR /home/work/bin
+
+# Runtime env:
+#   PRUNER_BACKBONE    — MiMo-V2-Flash model path (e.g. <PRESET_MODELS_DIR>)
+#   PRUNER_CHECKPOINT  — pruning head checkpoint dir
+# Optional:
+#   SGLANG_PORT        — SGLang HTTP port (default: 9001, internal)
+#   PRUNER_PORT        — pruner server port (default: 8001, internal)
+#   PRUNER_HIDDEN_SIZE — backbone hidden_size for PruningHead init
+#                        (default: 4096 for MiMo-V2-Flash)
+#   PRUNER_DEVICE      — pruning head GPU (default: cuda:0)
+#   PRUNER_MAX_LENGTH  — max input length (default: 16384)
+#
+# Topology: single node × 8 GPU (tp=8).
+#   nginx (80) + health (9000) + SGLang (9001) + pruner (8001)
+#
+# External access (via nginx on port 80):
+#   /model-raw/*     → SGLang (strip prefix)
+#   /prune-server/*  → Pruner (strip prefix)
+#   /*               → Pruner (default)
+
+EXPOSE 80 9000
+CMD ["bash", "/home/work/bin/start.sh"]

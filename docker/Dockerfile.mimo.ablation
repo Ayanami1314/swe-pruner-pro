@@ -1,0 +1,265 @@
+# Placeholders to fill in for your environment:
+#   <YOUR_SGLANG_BASE_IMAGE>   — base SGLang image (e.g. lmsys/sglang:0.5.8.post1)
+#                                The image must ship sglang 0.5.8 or 0.5.10. We
+#                                upgrade to 0.5.10.post1 + overlay our HS-bug
+#                                patches in subsequent layers.
+#   <YOUR_REGISTRY>            — your container registry prefix
+#   <PRESET_MODELS_DIR>        — path inside the container where the backbone
+#                                weights are mounted (was /preset-models)
+#   <HF_CACHE_DIR>             — path to the HuggingFace cache (was a
+#                                JuiceFS mount in the original setup)
+#
+# Ablation image for the MiMo-V2-Flash pruner backbone: extends the production
+# MiMo image with baseline pruners (LLMLingua-2, SelectiveContext, LongCodeZip
+# coarse, BGE-Reranker-v2-m3, self-prune, swe-pruner reference). Built/published
+# independently from the main Dockerfile.mimo via deploy_mimo_ablation.sh —
+# production MiMo deploys are unaffected.
+#
+# Tag convention: <YOUR_REGISTRY>/<image>
+#
+# Runtime extras over the base MiMo image (same payload as Dockerfile.pruner-ablation):
+#   - llmlingua (PromptCompressor)
+#   - selective-context + spaCy en_core_web_sm
+#   - rank_bm25 (LongCodeZip helper)
+#   - FlagEmbedding (bge-reranker-v2-m3 wrapper used by single_turn reranker)
+#   - tiktoken cl100k_base (LLMLingua-2 tokenizer; cached offline)
+#   - HF model snapshots mounted from JuiceFS at runtime (not bundled)
+#   - swe-pruner reference repo cloned to /opt/swe-pruner-ref
+#
+# All HF/tiktoken/spaCy assets are pre-downloaded at build time so CML pods
+# (which are offline) can construct each baseline without network access.
+
+FROM <YOUR_REGISTRY>/swe-pruner-mimo:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── git (needed only if you re-enable network clones; assets are local) ──
+RUN apt-get update -qq && apt-get install -y -qq git ca-certificates \
+        >/dev/null 2>&1 && rm -rf /var/lib/apt/lists/*
+
+# ── Pre-downloaded wheels (run download_ablation_assets.sh first) ─────────
+# Everything below installs OFFLINE from these COPY'd directories. No PyPI,
+# no HuggingFace, no GitHub fetches during the build.
+COPY <YOUR_ABLATION_ASSETS>/wheels/ /tmp/ablation-wheels/
+
+# Modern stack first (spacy>=3.7, nltk, tiktoken, llmlingua, rank-bm25).
+# Split into two passes (same rationale as Dockerfile.pruner-ablation):
+#   1) llmlingua + rank-bm25 with --no-deps to avoid pip chasing torch's own
+#      METADATA under --no-index.
+#   2) spacy + nltk + tiktoken: pure-Python deps, normal resolution.
+RUN pip install --no-cache-dir --no-index --no-deps \
+        --find-links=/tmp/ablation-wheels \
+        "llmlingua>=0.2.2" \
+        "rank-bm25>=0.2.2"
+
+RUN pip install --no-cache-dir --no-index --find-links=/tmp/ablation-wheels \
+        "spacy>=3.7,<4.0" \
+        "nltk>=3.8" \
+        "tiktoken>=0.7"
+
+# accelerate — llmlingua2 + longcodezip both load HF models with
+# from_pretrained(device_map=...); transformers 5.x refuses to honor that
+# unless accelerate is installed. Base image lacks it.
+RUN pip install --no-cache-dir --no-index --no-deps \
+        --find-links=/tmp/ablation-wheels \
+        "accelerate>=1.0"
+
+# FlagEmbedding with --no-deps (it pulls ir-datasets which we don't need;
+# torch/transformers/peft are already in the base image).
+RUN pip install --no-cache-dir --no-index --no-deps \
+        --find-links=/tmp/ablation-wheels \
+        "FlagEmbedding>=1.2.0"
+
+# selective-context with --no-deps so its pinned spacy==3.2.0 is ignored.
+RUN pip install --no-cache-dir --no-index --no-deps \
+        --find-links=/tmp/ablation-wheels \
+        "selective-context>=0.1.4"
+
+# flash-attn — REQUIRED by swe-pruner ref (model_structure.py:215 hardcodes
+# attn_implementation="flash_attention_2"). Without it Qwen3-Reranker-0.6B
+# from_pretrained raises in the ref subprocess startup → FastAPI keeps serving
+# but `model is None` → every /prune returns 500. (Live pod 0515 caught this
+# the hard way.)
+#
+# Install via the EXACT wheel path — pip's `==2.8.3` against a wheel whose
+# version is `2.8.3+cu12torch2.9` is fragile across pip versions, and a silent
+# resolver miss leaves the layer empty. Direct path avoids that. Then verify
+# the import so the build fails loudly if anything is wrong.
+RUN pip install --no-cache-dir --no-deps \
+        /tmp/ablation-wheels/flash_attn-2.8.3+cu12torch2.9-cp312-cp312-linux_x86_64.whl && \
+    python3 -c "import flash_attn; assert flash_attn.__version__.startswith('2.8.3'), flash_attn.__version__; print('[build] flash_attn OK', flash_attn.__version__)"
+
+# spaCy en_core_web_sm wheel (downloaded by the script).
+# --no-deps: spacy itself was installed in the step above; the model's METADATA
+# pins spacy<3.8.0,>=3.7.2 which pip would otherwise try to re-resolve from the
+# narrower spacy-model/ find-links.
+RUN pip install --no-cache-dir --no-index --no-deps \
+        --find-links=/tmp/ablation-wheels/spacy-model \
+        en_core_web_sm
+
+# Free up image space — wheels are no longer needed after install.
+RUN rm -rf /tmp/ablation-wheels
+
+# ── Tiktoken cache (cl100k_base) ──────────────────────────────────────────
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+COPY <YOUR_ABLATION_ASSETS>/tiktoken-cache/ /opt/tiktoken-cache/
+
+# ── HuggingFace cache lives on JuiceFS ────────────────────────────────────
+# We do NOT bundle HF model snapshots (gpt2, llmlingua-2, bge-reranker-v2-m3,
+# Qwen2.5-Coder-1.5B-Instruct) into the image — together they're ~8GB and
+# the production image pattern already mounts /mnt/user-ssd/.../models/ at
+# runtime. Set HF_HOME at deploy time to point at a populated cache, e.g.:
+#   HF_HOME=<HF_CACHE_DIR>
+ENV HF_HOME=<HF_CACHE_DIR>
+
+# HF_HOME is a read-only JuiceFS mount in CML, but transformers' trust_remote_code
+# path calls os.makedirs($HF_HOME/modules, exist_ok=True) at model-load time to
+# cache dynamic .py files — that write fails with EPERM on read-only mounts.
+# Redirect modules cache to a writable in-container path. Snapshots stay on
+# JuiceFS; only the (small) dynamic-module shims land here.
+ENV HF_MODULES_CACHE=/home/work/hf-modules
+RUN mkdir -p /home/work/hf-modules
+
+# Switch to offline so loaders skip network entirely.
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+
+# ── swe-pruner reference repo (cloned locally by the download script) ────
+COPY <YOUR_ABLATION_ASSETS>/swe-pruner-ref/ /opt/swe-pruner-ref/
+
+# The ref repo is a hatchling-packaged project under swe-pruner/ (pyproject.toml
+# exposes the `swe-pruner` CLI via `swe_pruner.online_serving:main`). We DO NOT
+# pip install the package (hatchling wheel build would need network, and the
+# deps are already satisfied by the base image). Instead we add the src dir to
+# PYTHONPATH so `python -m swe_pruner.online_serving serve ...` works from any cwd.
+ENV SWE_PRUNER_REF_DIR=/opt/swe-pruner-ref/swe-pruner
+
+# ── Baseline source code ──────────────────────────────────────────────────
+# The baselines/ package lives next to pruner_server.py in the repo. Copy it
+# into the image so pruner_server.py can import baselines.X at startup when
+# EXTRA_PRUNERS is set. Also bring along the single_turn helpers
+# (reranker.py, code_compressor.py) that two of the baselines reuse.
+COPY <YOUR_ABLATION_ASSETS>/baselines/ /home/work/bin/baselines/
+COPY <YOUR_ABLATION_ASSETS>/single_turn/reranker.py \
+     /home/work/bin/single_turn_helpers/reranker.py
+COPY <YOUR_ABLATION_ASSETS>/single_turn/embedder.py \
+     /home/work/bin/single_turn_helpers/embedder.py
+COPY <YOUR_ABLATION_ASSETS>/single_turn/longcodeqa/code_compressor.py \
+     /home/work/bin/single_turn_helpers/code_compressor.py
+
+# Make the single_turn helpers importable without modifying baselines/ paths
+# (which currently sys.path.insert the absolute repo path used on JuiceFS).
+# Also include the swe-pruner ref src/ so `python -m swe_pruner.online_serving`
+# works in the subprocess launched by baselines/swe_pruner.py.
+ENV PYTHONPATH=/home/work/bin/single_turn_helpers:/home/work/bin:/opt/swe-pruner-ref/swe-pruner/src
+
+# ── Ablation start.sh override (MiMo flavor) ──────────────────────────────
+# Same as Dockerfile.mimo's start.sh, except:
+#   - SGLang --mem-fraction-static drops when EXTRA_PRUNERS is set, leaving
+#     headroom on each card for the per-baseline weights (MiMo's base value
+#     is 0.75; ablation default is 0.6).
+#   - pruner_server.py is invoked with --extra-pruners "$EXTRA_PRUNERS".
+#   - BASELINE_GPU_START defaults to 0 (each baseline binds to cuda:N
+#     starting from there).
+#   - MiMo launch flags are preserved verbatim (tp=8 dp=2 dp-attention,
+#     page-size 1, EAGLE speculative decode, MiMo reasoning/tool parsers,
+#     --context-length 262144, --attention-backend fa3, PRUNER_HIDDEN_SIZE
+#     defaulting to 4096 for MiMo-V2-Flash).
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '' \
+    'SGLANG_PORT="${SGLANG_PORT:-9001}"' \
+    'PRUNER_PORT="${PRUNER_PORT:-8001}"' \
+    'PRUNER_HIDDEN_SIZE="${PRUNER_HIDDEN_SIZE:-4096}"  # MiMo-V2-Flash hidden_size' \
+    'EXTRA_PRUNERS=${EXTRA_PRUNERS:-}' \
+    'BASELINE_GPU_START=${BASELINE_GPU_START:-0}' \
+    '' \
+    '# Lower SGLang mem fraction in ablation mode so per-baseline weights fit.' \
+    'if [ -n "$EXTRA_PRUNERS" ]; then' \
+    '    MEM_FRAC=${SGLANG_MEM_FRACTION:-0.8}' \
+    'else' \
+    '    MEM_FRAC=${SGLANG_MEM_FRACTION:-0.8}' \
+    'fi' \
+    '' \
+    'echo "[start-mimo-ablation] single-node deployment (tp=8 dp=2 dp-attention)"' \
+    'echo "[start-mimo-ablation] EXTRA_PRUNERS=$EXTRA_PRUNERS  MEM_FRAC=$MEM_FRAC"' \
+    '' \
+    '# Health probe (k8s liveness)' \
+    'nohup python3 /home/work/bin/health.py \' \
+    '    1>/home/work/log/health.log 2>&1 &' \
+    '' \
+    'launch_sglang() {' \
+    '  python3 -m sglang.launch_server \' \
+    '        --model-path "$PRUNER_BACKBONE" \' \
+    '        --served-model-name mimo-v2-flash \' \
+    '        --tp-size 8 \' \
+    '        --dp-size 2 \' \
+    '        --enable-dp-attention \' \
+    '        --moe-a2a-backend deepep \' \
+    '        --page-size 1 \' \
+    '        --host 0.0.0.0 \' \
+    '        --port "$SGLANG_PORT" \' \
+    '        --trust-remote-code \' \
+    '        --mem-fraction-static "$MEM_FRAC" \' \
+    '        --max-running-requests 128 \' \
+    '        --reasoning-parser qwen3 \' \
+    '        --tool-call-parser mimo \' \
+    '        --context-length 262144 \' \
+    '        --attention-backend fa3 \' \
+    '        --enable-return-hidden-states' \
+    '}' \
+    '' \
+    'nginx' \
+    'echo "[start-mimo-ablation] Nginx started on port 80"' \
+    '' \
+    'echo "[start-mimo-ablation] Starting SGLang: model=$PRUNER_BACKBONE, tp=8 dp=2, port=$SGLANG_PORT"' \
+    'if [ -n "$PRUNER_CHECKPOINT" ]; then echo "[start] embedded head: $PRUNER_CHECKPOINT"; export PRUNER_EMBEDDED_HEAD=1; fi' \
+    '( while true; do' \
+    '    echo "[supervisor] starting SGLang at $(date)" >> /home/work/log/sglang.log' \
+    '    launch_sglang 1>>/home/work/log/sglang.log 2>&1' \
+    '    echo "[supervisor] SGLang exited (rc=$?) at $(date), restart in 10s" >> /home/work/log/sglang.log' \
+    '    sleep 10' \
+    '  done ) &' \
+    '' \
+    'echo "[start-mimo-ablation] Starting pruner: checkpoint=$PRUNER_CHECKPOINT port=$PRUNER_PORT extras=$EXTRA_PRUNERS"' \
+    'exec python3 /home/work/bin/pruner_server.py \' \
+    '    --sglang-url "http://localhost:$SGLANG_PORT" \' \
+    '    --port "$PRUNER_PORT" \' \
+    '    --host "0.0.0.0" \' \
+    '    --device "${PRUNER_DEVICE:-cuda:0}" \' \
+    '    --hidden-size "$PRUNER_HIDDEN_SIZE" \' \
+    '    --max-length "${PRUNER_MAX_LENGTH:-16384}" \' \
+    '    --extra-pruners "$EXTRA_PRUNERS" \' \
+    '    2>&1 | tee /home/work/log/pruner.log' \
+    > /home/work/bin/start.sh
+
+RUN chmod +x /home/work/bin/start.sh
+
+# Refresh pruner_server.py in case the base image's copy is older than the
+# in-repo version while iterating on the ablation routing.
+COPY src/swe_pruner_pro/serving/pruner_server.py /home/work/bin/pruner_server.py
+
+WORKDIR /home/work/bin
+
+# Runtime env (set at deploy time):
+#   PRUNER_BACKBONE            — MiMo-V2-Flash model path (e.g. <PRESET_MODELS_DIR>)
+#   PRUNER_CHECKPOINT          — pruning head checkpoint dir
+# Optional:
+#   EXTRA_PRUNERS              — comma list (llmlingua2,longcodezip,...)
+#   BASELINE_GPU_START         — first GPU to bind baselines to (default 0)
+#   SGLANG_MEM_FRACTION        — override the auto-selected mem fraction
+#                                (0.6 with EXTRA_PRUNERS, 0.75 without)
+#   SGLANG_PORT                — SGLang HTTP port (default: 9001, internal)
+#   PRUNER_PORT                — pruner server port (default: 8001, internal)
+#   PRUNER_HIDDEN_SIZE         — backbone hidden_size (default: 4096 for MiMo)
+#   PRUNER_DEVICE              — pruning head GPU (default: cuda:0)
+#   PRUNER_MAX_LENGTH          — max input length (default: 16384)
+#   HF_HOME                    — JuiceFS path with pre-downloaded HF snapshots
+#                                (default <HF_CACHE_DIR>)
+#   SWE_PRUNER_REF_URL         — pre-launched ref-service URL (skip subprocess)
+#   SWE_PRUNER_REF_LAUNCH_CMD  — override the subprocess command
+#   LONGCODEZIP_MODEL_PATH     — override the LongCodeZip ranking LLM
+
+EXPOSE 80 9000
+CMD ["bash", "/home/work/bin/start.sh"]
