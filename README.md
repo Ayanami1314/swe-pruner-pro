@@ -1,164 +1,263 @@
-# SWE-Pruner Pro
-## 1. Repository layout, environment, container prep
+# SWE-Pruner Pro: The Coder LLM Already Knows What to Prune
 
-### Layout
+<p align="center">
+  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Code-GitHub-181717.svg" alt="Code"></a>
+  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow.svg" alt="Model"></a>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/License-Apache--2.0-green.svg" alt="License">
+</p>
 
-```
-src/swe_pruner_pro/
-  model/        Pruning head + length-aware embedding
-  data/         Trajectory parsing, diversity sampling, Claude labelling,
-                hidden-state extraction, packing into memmap shards
-  train/        From-features head training (frozen backbone)
-  serving/      FastAPI pruner server (talks to a patched SGLang)
-  eval/
-    sweqa/      SWE-QA / SWE-QA-Pro multi-turn agent + judge
-    oolong/     Multi-turn re-cast of Oolong
-    swebench/   mini-swe-agent fork with pruner integration
-    baselines/  LLMLingua2, Selective Context, RAG, Self-Prune,
-                LongCodeZip, SWE-Pruner
-  prompts/      Labelling + judge prompts
+<p align="center">
+  <a href="#news">News</a> |
+  <a href="#overview">Overview</a> |
+  <a href="#results">Results</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#reproduction">Reproduction</a> |
+  <a href="#repository-layout">Repository Layout</a> |
+  <a href="#citation">Citation</a>
+</p>
 
-patches/sglang/ Overlay against sglang 0.5.10.post1 (3 bug fixes
-                + binary HS envelope + optional in-engine head hook)
-docker/         Six Dockerfiles (Coder-Next / MiMo × in-engine /
-                off-engine / ablation) + build & deploy scripts
-scripts/        Reproduction shell scripts
-data/           Labelled training corpus (22,609 samples) + case bundles
-utils/          Figure / stats / motivation-probe / latency scripts
-```
+SWE-Pruner Pro is a lightweight in-agent context pruner for long-horizon coding agents. Instead of
+asking a separate scoring model to compress tool outputs, SWE-Pruner Pro reads the keep-or-prune
+signal directly from the coding agent's own hidden states. A small pruning head attaches to the
+frozen backbone, predicts line-level masks for each tool response, and replaces the raw response
+with a compact skeleton in the next turn.
 
-### Python environment
+<p align="center">
+  <img src="figs/overview.png" alt="SWE-Pruner Pro overview" width="95%">
+</p>
+
+## News
+
+- **2026-06-18**: Initial project page released with code, SGLang patches, reproduction scripts, and README figures.
+- **Coming soon**: Hugging Face model weights, and full release artifacts.
+
+
+## Results
+
+Across two open-weight coding backbones and four multi-turn benchmarks, SWE-Pruner Pro is designed
+to reduce the end-to-end context burden while preserving task quality. On the read-only multi-turn
+benchmarks, it is the only evaluated pruner that reduces tokens in every reported setting.
+
+<p align="center">
+  <img src="figs/main-results.png" alt="SWE-Pruner Pro main results" width="95%">
+</p>
+
+
+## Installation
+
+SWE-Pruner Pro supports Python 3.10 or newer. The paper environment used Python
+3.12, PyTorch 2.9, and CUDA 12.x.
 
 ```bash
-pip install -e .                              # core
-pip install -e ".[train,eval,baselines]"     # add training + eval extras
+git clone https://github.com/Ayanami1314/swe-pruner-pro.git
+cd swe-pruner-pro
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -e .
+pip install -e ".[train,eval,baselines]"
 ```
 
-Python 3.12, PyTorch 2.9, CUDA 12.x. Multi-GPU training uses `torchrun`; eval
-needs HTTP access to a running pruner server.
+The package exposes one console entry point:
 
-### Container build (only needed for inference / production serving)
+```bash
+swe-pruner-server --help
+```
 
-The pruner server is built on top of SGLang. We ship six Dockerfiles under
-`docker/`; pick the one matching `<backbone> × <head placement>`:
+## Quick Start
 
-| Variant                              | Backbone        | Head        |
-|--------------------------------------|-----------------|-------------|
-| `Dockerfile.coder-next.in-engine`    | Qwen3-Coder-Next| in-engine   |
-| `Dockerfile.coder-next.off-engine`   | Qwen3-Coder-Next| off-engine  |
-| `Dockerfile.coder-next.ablation`     | Qwen3-Coder-Next| off + 6 baselines |
-| `Dockerfile.mimo.in-engine`          | MiMo-V2-Flash   | in-engine   |
-| `Dockerfile.mimo.off-engine`         | MiMo-V2-Flash   | off-engine  |
-| `Dockerfile.mimo.ablation`           | MiMo-V2-Flash   | off + 6 baselines |
+The released server expects a running SGLang backend that exposes hidden states and a trained pruning
+head checkpoint. Until the Hugging Face release is public, set these paths to your local backbone and
+checkpoint directories.
 
-Before building, fill these placeholders in the chosen Dockerfile and any
-`deploy*.sh` you use:
+```bash
+# 1. Launch patched SGLang separately with hidden-state return enabled.
+#    See patches/sglang/README.md for the overlay and serving flags.
 
-| Placeholder                | What to put |
-|----------------------------|-------------|
-| `<YOUR_SGLANG_BASE_IMAGE>` | base sglang image (we used `lmsys/sglang:0.5.8.post1`; the layer upgrades to 0.5.10.post1 and applies `patches/sglang/`) |
-| `<YOUR_REGISTRY>`          | container registry you can push to |
-| `<PRESET_MODELS_DIR>`      | mount point for backbone weights inside the container (was `/preset-models`) |
-| `<HF_CACHE_DIR>`           | pre-populated HF cache mount (ablation images only) |
-| `<YOUR_ABLATION_ASSETS>`   | directory with pre-downloaded wheels for the baselines (ablation images only — see `docker/README.md` for the wheel list) |
+# 2. Start the pruning server.
+export BACKBONE_PATH=/path/to/backbone
+export HEAD_CKPT_DIR=/path/to/head_checkpoint
+export SGLANG_URL=http://localhost:30000
 
-Then:
+swe-pruner-server \
+  --backbone "$BACKBONE_PATH" \
+  --checkpoint "$HEAD_CKPT_DIR" \
+  --sglang-url "$SGLANG_URL" \
+  --port 8001
+```
+
+The server exposes:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Check pruning-head loading and SGLang reachability. |
+| `POST /prune` | Prune one `(history, tool_call, tool_response)` step into a compact response. |
+
+Minimal request shape:
+
+```bash
+curl -s http://localhost:8001/prune \
+  -H "Content-Type: application/json" \
+  -d '{
+    "history": [],
+    "tool_call": {"name": "bash", "arguments": {"command": "cat src/example.py"}},
+    "tool_response": "def parse_config(path):\n    cfg = {}\n    return cfg\n",
+    "threshold": 0.5
+  }'
+```
+
+## Reproduction
+
+This repository contains the scripts used to train the pruning head, serve it, and reproduce the
+paper's benchmark sweeps. Paths and model identifiers should be adapted to your cluster, checkpoint,
+and API setup.
+
+### Training the Head
+
+The head is trained from cached hidden-state features extracted from the frozen backbone.
+
+```bash
+# Extract and pack features from the labelled corpus.
+BACKBONE=/path/to/backbone TP_SIZE=8 \
+  bash scripts/extract_features.sh
+
+# Train the Qwen3-Coder-Next head.
+FEATURES_DIR=features/run0/packed \
+  bash scripts/train_coder_next.sh
+
+# Or train the MiMo-V2-Flash head.
+FEATURES_DIR=features/run0/packed \
+  bash scripts/train_mimo.sh
+```
+
+Default training settings match the paper recipe: 10 epochs, cosine learning-rate decay from
+`3e-5` to `1.5e-5`, dropout `0.4`, per-sample balanced focal loss with gamma `2`, and the
+length-aware embedding enabled.
+
+### Running SWE-QA, SWE-QA-Pro, and Oolong
+
+All evaluation entry points use OpenAI-compatible model endpoints plus a running pruner server.
+
+```bash
+export PRUNER_URL=http://localhost:8001
+export BASE_URL=http://localhost:30000/v1
+export MODEL=your-served-model-id
+
+bash scripts/run_eval.sh sweqa
+bash scripts/run_eval.sh sweqa-pro
+bash scripts/run_eval.sh oolong
+```
+
+### Running SWE-Bench Verified
+
+```bash
+export PRUNER_URL=http://localhost:8001
+export BASE_URL=http://localhost:30000/v1
+export MODEL_CODER_NEXT=openai/qwen/qwen3-coder-next
+export MODEL_MIMO=openai/xiaomi/mimo-v2-flash
+
+bash scripts/run_swebench.sh
+```
+
+Predictions are written as `preds.json` files under `results/swebench/`. Score them with the
+standard SWE-Bench CLI:
+
+```bash
+for d in results/swebench/*/preds.json; do
+  name=$(basename "$(dirname "$d")")
+  uv run sb-cli submit swe-bench_verified test \
+    --predictions_path "$d" \
+    --run_id "$name"
+done
+```
+
+### Docker Serving
+
+The `docker/` directory includes six image recipes covering two backbones and three serving modes:
+
+| Variant family | Backbones | Head placement |
+| --- | --- | --- |
+| `coder-next-*` | Qwen3-Coder-Next | in-engine, off-engine, or ablation |
+| `mimo-*` | MiMo-V2-Flash | in-engine, off-engine, or ablation |
+
+Before building, fill the placeholders documented in `docker/README.md`, then run:
 
 ```bash
 ./docker/build.sh --variant coder-next-in-engine --tag v1
-# or the full matrix:
-for v in coder-next-{in-engine,off-engine,ablation} \
-         mimo-{in-engine,off-engine,ablation}; do
-    ./docker/build.sh --variant "$v"
-done
 ```
 
-The SGLang overlay is pure-Python; for a non-Docker workflow just copy it on
-top of an installed sglang — see `patches/sglang/README.md`.
-
----
-
-## 2. Training
-
-### What to edit
-
-`scripts/train_coder_next.sh` and `scripts/train_mimo.sh` are the two recipes
-that reproduce the paper checkpoints. Only the four env vars at the top change:
-
-| Var            | Default                                | Override when |
-|----------------|----------------------------------------|---------------|
-| `FEATURES_DIR` | `features/{coder_next,mimo_v2_flash}/packed` | You extracted features somewhere else. |
-| `EVAL_DATA`    | `data/training_corpus_22k.jsonl`        | You want to eval on a different split. |
-| `LOG_DIR`      | `logs/...`                      | Naming a new run. |
-| `NPROC`        | `8`                                     | Different GPU count. |
-
-The hyperparameters (10 epochs, lr 3e-5 → 1.5e-5 cosine, dropout 0.4,
-per-sample balanced focal γ=2, length-aware embedding on) are the
-paper-recommended setting; only change them through CLI flags to
-`swe_pruner_pro.train.train`.
-
-### How to run
+For non-Docker serving, apply the pure-Python SGLang overlay directly:
 
 ```bash
-# 1) (one-time per backbone) extract hidden-state features from the corpus
-#    Requires the patched SGLang running locally.
-BACKBONE=<path-or-hf-id> TP_SIZE=8 \
-    bash scripts/extract_features.sh
-# -> features/run0/packed/
-
-# 2) Train the head (5 min on 8×H200)
-FEATURES_DIR=features/run0/packed \
-    bash scripts/train_coder_next.sh   # or train_mimo.sh
-# -> logs/0507b_size_emb_coder_next_22k/best_model.pt + model_config.json
+SGLANG_DIR=$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')
+cp -r patches/sglang/srt/* "$SGLANG_DIR/srt/"
 ```
 
-(Optional) Re-build the corpus from scratch with `scripts/label_data.sh` —
-this calls Claude Sonnet 4.6 and costs Anthropic API credits.
+## Release Status
 
----
+| Artifact | Status |
+| --- | --- |
+| Paper | Placeholder badge; arXiv link will be updated after release. |
+| Model weights | Placeholder badge; Hugging Face link will be updated after release. |
+| Training corpus | Scripts expect `data/training_corpus_22k.jsonl`; full corpus release is pending. |
+| Case studies | Included under `data/cases/`. |
+| SGLang patches | Included under `patches/sglang/`. |
 
-## 3. Inference + downstream evals
+## Repository Layout
 
-### What to edit
+```text
+src/swe_pruner_pro/
+  model/        Pruning head and length-aware embedding
+  data/         Trajectory parsing, sampling, labelling, feature extraction, packing
+  train/        From-features head training with a frozen backbone
+  serving/      FastAPI pruning server for patched SGLang
+  eval/
+    sweqa/      SWE-QA and SWE-QA-Pro agent evaluation
+    oolong/     Multi-turn Oolong agent evaluation
+    swebench/   Mini-SWE-Agent fork with pruner integration
+    baselines/  LLMLingua2, Selective Context, RAG, Self-Prune, LongCodeZip, SWE-Pruner
+  prompts/      Labelling, ablation-judge, and answer-judge prompts
 
-All eval entry points are HTTP clients; they need three URLs / IDs:
+patches/sglang/ SGLang 0.5.10.post1 overlay for hidden-state extraction and in-engine heads
+docker/         Dockerfiles and deployment scripts for Coder-Next and MiMo variants
+scripts/        Training, feature extraction, and benchmark reproduction scripts
+data/cases/     Qualitative and judge-vs-F1 case bundles
+figs/           README and paper figures
+utils/          Figure, statistics, motivation-probe, and latency utilities
+```
 
-| Env var        | What it is |
-|----------------|------------|
-| `PRUNER_URL`   | The pruner FastAPI server (one of the Docker images above, or `swe-pruner-server …` run manually). |
-| `BASE_URL`     | OpenAI-compatible endpoint serving the agent backbone. In the bundled Docker images this is `${PRUNER_URL}/model-raw/v1`. |
-| `MODEL` / `MODEL_CODER_NEXT` / `MODEL_MIMO` | Model id as advertised by `BASE_URL`. |
+## Development
 
-If running the pruner server outside the Docker image, point it at your head
-checkpoint:
+Basic import check:
 
 ```bash
-swe-pruner-server \
-    --backbone "$BACKBONE_PATH" \
-    --checkpoint <your_head_ckpt_dir> \
-    --sglang-url "$SGLANG_URL"
+python -m py_compile src/swe_pruner_pro/serving/pruner_server.py
 ```
 
-### How to run
+Install evaluation and baseline extras when touching benchmark code:
 
 ```bash
-# SWE-QA / SWE-QA-Pro / Oolong (all use the same eval entrypoint)
-PRUNER_URL=… BASE_URL=… MODEL=… bash scripts/run_eval.sh sweqa
-PRUNER_URL=… BASE_URL=… MODEL=… bash scripts/run_eval.sh sweqa-pro
-PRUNER_URL=… BASE_URL=… MODEL=… bash scripts/run_eval.sh oolong
-
-# SWE-Bench Verified — reproduces the paper sweep (2 backbones × 5 prune configs)
-PRUNER_URL=… BASE_URL=… \
-MODEL_CODER_NEXT=openai/qwen/qwen3-coder-next \
-MODEL_MIMO=openai/xiaomi/mimo-v2-flash \
-    bash scripts/run_swebench.sh
-# Predictions are written as preds.json per setting; score with sb-cli:
-for d in results/swebench/*/preds.json; do
-    name=$(basename $(dirname $d))
-    uv run sb-cli submit swe-bench_verified test \
-        --predictions_path "$d" --run_id "$name"
-done
+pip install -e ".[eval,baselines]"
 ```
 
-The judge step (LLM-as-judge for SWE-QA / SWE-QA-Pro) is invoked inside
-`agent_eval.py` and reads `OPENAI_API_KEY` for the judge API.
+## Citation
+
+If you find SWE-Pruner Pro useful, please cite the paper. The BibTeX entry will be updated after
+the public arXiv release.
+
+```bibtex
+@misc{sweprunerpro2026,
+  title = {SWE-Pruner Pro: The Coder LLM Already Knows What to Prune},
+  author = {Anonymous},
+  year = {2026},
+  url = {https://github.com/Ayanami1314/swe-pruner-pro}
+}
+```
+
+## Acknowledgements
+
+SWE-Pruner Pro builds on open coding-agent infrastructure and benchmarks, including SWE-Bench
+Verified, SWE-QA, SWE-QA-Pro, Oolong, Mini-SWE-Agent, SGLang, and open-weight coding backbones.
