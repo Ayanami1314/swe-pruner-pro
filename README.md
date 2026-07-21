@@ -1,9 +1,9 @@
 # SWE-Pruner Pro: The Coder LLM Already Knows What to Prune
 
 <p align="center">
-  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/arXiv-2607.18213-b31b1b.svg" alt="arXiv"></a>
   <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Code-GitHub-181717.svg" alt="Code"></a>
-  <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow.svg" alt="Model"></a>
+  <!-- <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow.svg" alt="Model"></a> -->
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/License-Apache--2.0-green.svg" alt="License">
 </p>
@@ -30,7 +30,9 @@ with a compact skeleton in the next turn.
 
 ## News
 
-- **2026-06-18**: Initial project page released with code, SGLang patches, reproduction scripts, and README figures.
+- **2026-07-21**: We release the arxiv version of our paper, see `https://arxiv.org/abs/2607.18213`
+- **2026-06-18**: Released cleaned project page with code, SGLang patches, reproduction scripts, and README figures.
+- **2026-05-25**: The project is completed. Start organizing the code.
 - **Coming soon**: Hugging Face model weights, and full release artifacts.
 
 
@@ -249,11 +251,14 @@ If you find SWE-Pruner Pro useful, please cite the paper. The BibTeX entry will 
 the public arXiv release.
 
 ```bibtex
-@misc{sweprunerpro2026,
-  title = {SWE-Pruner Pro: The Coder LLM Already Knows What to Prune},
-  author = {Anonymous},
-  year = {2026},
-  url = {https://github.com/Ayanami1314/swe-pruner-pro}
+@misc{wang2026sweprunerprocoderllm,
+      title={SWE-Pruner Pro: The Coder LLM Already Knows What to Prune}, 
+      author={Yuhang Wang and Yuling Shi and Shaoqiu Zhang and Jialiang Liang and Shilin He and Siyu Ye and Yuting Chen and Kai Cai and Xiaodong Gu},
+      year={2026},
+      eprint={2607.18213},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2607.18213}, 
 }
 ```
 
