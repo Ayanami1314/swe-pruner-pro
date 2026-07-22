@@ -35,7 +35,6 @@ with a compact skeleton in the next turn.
 - **2026-07-21**: We release the arxiv version of our paper, see `https://arxiv.org/abs/2607.18213`
 - **2026-06-18**: Released cleaned project page with code, SGLang patches, reproduction scripts, and README figures.
 - **2026-05-25**: The project is completed. Start organizing the code.
-- **Coming soon**: Hugging Face model weights, and full release artifacts.
 
 
 ## Results
