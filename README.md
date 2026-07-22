@@ -198,16 +198,6 @@ SGLANG_DIR=$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__
 cp -r patches/sglang/srt/* "$SGLANG_DIR/srt/"
 ```
 
-## Release Status
-
-| Artifact        | Status                                                                           |
-| --------------- | -------------------------------------------------------------------------------- |
-| Paper           | Placeholder badge; arXiv link will be updated after release.                     |
-| Model weights   | Placeholder badge; Hugging Face link will be updated after release.              |
-| Training corpus | Scripts expect `data/training_corpus_22k.jsonl`; full corpus release is pending. |
-| Case studies    | Included under `data/cases/`.                                                    |
-| SGLang patches  | Included under `patches/sglang/`.                                                |
-
 ## Repository Layout
 
 ```text
