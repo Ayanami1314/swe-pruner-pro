@@ -46,7 +46,6 @@ benchmarks, it is the only evaluated pruner that reduces tokens in every reporte
   <img src="figs/main-results.png" alt="SWE-Pruner Pro main results" width="95%">
 </p>
 
-
 ## Installation
 
 SWE-Pruner Pro supports Python 3.10 or newer. The paper environment used Python
@@ -93,9 +92,9 @@ swe-pruner-server \
 
 The server exposes:
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /health` | Check pruning-head loading and SGLang reachability. |
+| Endpoint      | Purpose                                                                       |
+| ------------- | ----------------------------------------------------------------------------- |
+| `GET /health` | Check pruning-head loading and SGLang reachability.                           |
 | `POST /prune` | Prune one `(history, tool_call, tool_response)` step into a compact response. |
 
 Minimal request shape:
@@ -180,10 +179,10 @@ done
 
 The `docker/` directory includes six image recipes covering two backbones and three serving modes:
 
-| Variant family | Backbones | Head placement |
-| --- | --- | --- |
+| Variant family | Backbones        | Head placement                     |
+| -------------- | ---------------- | ---------------------------------- |
 | `coder-next-*` | Qwen3-Coder-Next | in-engine, off-engine, or ablation |
-| `mimo-*` | MiMo-V2-Flash | in-engine, off-engine, or ablation |
+| `mimo-*`       | MiMo-V2-Flash    | in-engine, off-engine, or ablation |
 
 Before building, fill the placeholders documented in `docker/README.md`, then run:
 
@@ -200,13 +199,13 @@ cp -r patches/sglang/srt/* "$SGLANG_DIR/srt/"
 
 ## Release Status
 
-| Artifact | Status |
-| --- | --- |
-| Paper | Placeholder badge; arXiv link will be updated after release. |
-| Model weights | Placeholder badge; Hugging Face link will be updated after release. |
+| Artifact        | Status                                                                           |
+| --------------- | -------------------------------------------------------------------------------- |
+| Paper           | Placeholder badge; arXiv link will be updated after release.                     |
+| Model weights   | Placeholder badge; Hugging Face link will be updated after release.              |
 | Training corpus | Scripts expect `data/training_corpus_22k.jsonl`; full corpus release is pending. |
-| Case studies | Included under `data/cases/`. |
-| SGLang patches | Included under `patches/sglang/`. |
+| Case studies    | Included under `data/cases/`.                                                    |
+| SGLang patches  | Included under `patches/sglang/`.                                                |
 
 ## Repository Layout
 
