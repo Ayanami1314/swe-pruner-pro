@@ -3,7 +3,8 @@
 <p align="center">
   <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/arXiv-2607.18213-b31b1b.svg" alt="arXiv"></a>
   <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Code-GitHub-181717.svg" alt="Code"></a>
-  <!-- <a href="https://github.com/Ayanami1314/swe-pruner-pro"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow.svg" alt="Model"></a> -->
+  <a href="https://huggingface.co/ayanami-kitasan/swe-pruner-pro-qwen3-coder-next-head"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow.svg" alt="Model"></a>
+  <a href="https://huggingface.co/datasets/ayanami-kitasan/swe-pruner-pro-training-corpus"><img src="https://img.shields.io/badge/Dataset-Hugging%20Face-yellow.svg" alt="Dataset"></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/License-Apache--2.0-green.svg" alt="License">
 </p>
@@ -30,6 +31,7 @@ with a compact skeleton in the next turn.
 
 ## News
 
+- **2026-07-22**: We release the pruning head weights and training corpus on Hugging Face: [Qwen3-Coder-Next Head](https://huggingface.co/ayanami-kitasan/swe-pruner-pro-qwen3-coder-next-head), [MiMo-V2-Flash Head](https://huggingface.co/ayanami-kitasan/swe-pruner-pro-mimo-v2-flash-head), [Training Corpus (22k)](https://huggingface.co/datasets/ayanami-kitasan/swe-pruner-pro-training-corpus).
 - **2026-07-21**: We release the arxiv version of our paper, see `https://arxiv.org/abs/2607.18213`
 - **2026-06-18**: Released cleaned project page with code, SGLang patches, reproduction scripts, and README figures.
 - **2026-05-25**: The project is completed. Start organizing the code.
