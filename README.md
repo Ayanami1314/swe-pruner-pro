@@ -1,3 +1,5 @@
+
+
 # SWE-Pruner Pro: The Coder LLM Already Knows What to Prune
 
 <p align="center">
@@ -72,8 +74,8 @@ swe-pruner-server --help
 ## Quick Start
 
 The released server expects a running SGLang backend that exposes hidden states and a trained pruning
-head checkpoint. Until the Hugging Face release is public, set these paths to your local backbone and
-checkpoint directories.
+head checkpoint. Set these paths to your local backbone and checkpoint directories, or use the
+Hugging Face released checkpoints.
 
 ```bash
 # 1. Launch patched SGLang separately with hidden-state return enabled.
