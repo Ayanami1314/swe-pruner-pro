@@ -537,5 +537,10 @@ def main(
     uvicorn.run(create_app(), host=host, port=port)
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Run the installed console command through Typer's argument parser."""
     typer.run(main)
+
+
+if __name__ == "__main__":
+    cli()
